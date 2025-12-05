@@ -1,0 +1,694 @@
+esphome:
+  name: lv600s_bridge
+  friendly_name: LV600S Bridge
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+
+logger:
+  level: DEBUG        # or INFO, as you like
+  baud_rate: 0        # IMPORTANT: don't use the hardware UART for logs
+
+api:
+  encryption:
+    key: "redacted"
+
+ota:
+  - platform: esphome
+    password: "redacted"
+
+wifi:
+  ssid: !secret ssid_Wifi
+  password: !secret password_Wifi
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "LV600s"
+    password: "redacted"
+
+captive_portal:
+
+# Simple incremental command ID (used as byte[2] on A5 22 frames)
+globals:
+  - id: lv_cmd_seq
+    type: int
+    initial_value: '0x20'
+    # Last "real" humidity target used in AUTO/HUMIDITY mode
+  - id: lv_saved_target_humidity
+    type: int
+    initial_value: '50'
+
+  # Last "real" cool level used when NOT in sleep
+  - id: lv_saved_cool_level
+    type: int
+    initial_value: '1'
+
+uart:
+  id: lv_uart
+  tx_pin: GPIO17        # ESP32 -> humidifier RX
+  rx_pin: GPIO16        # humidifier TX -> ESP32
+  baud_rate: 9800
+  data_bits: 8
+  parity: NONE
+  stop_bits: 1
+
+  debug:
+    direction: BOTH         # capture TX+RX
+    dummy_receiver: true    # don't block anything else from using UART if needed
+    after:
+      timeout: 50ms         # group bytes that arrive close together
+    sequence:
+      - lambda: |-
+          using std::vector;
+
+          // 'bytes' is a vector<uint8_t> that UART debug gives us for this chunk
+          // We keep a static buffer so we can stitch chunks together into full frames.
+          static vector<uint8_t> buffer;
+
+          // Append new chunk
+          buffer.insert(buffer.end(), bytes.begin(), bytes.end());
+
+          size_t pos = 0;
+          while (pos + 5 <= buffer.size()) {
+            // Find frame header
+            if (buffer[pos] != 0xA5) {
+              pos++;
+              continue;
+            }
+
+            bool found = false;
+            // Try possible frame ends, using sum & 0xFF == 0xFF as checksum rule
+            for (size_t end = pos + 5; end <= buffer.size(); end++) {
+              uint32_t s = 0;
+              for (size_t i = pos; i < end; i++) s += buffer[i];
+              if ((s & 0xFF) == 0xFF) {
+                // We have a complete frame [pos, end)
+                vector<uint8_t> frame(buffer.begin() + pos, buffer.begin() + end);
+
+                // -----------------------
+                // Publish raw frame as hex
+                // -----------------------
+                char hexbuf[256];
+                size_t n = 0;
+                for (size_t i = 0; i < frame.size(); i++) {
+                  if (n + 3 >= sizeof(hexbuf)) break;
+                  n += sprintf(hexbuf + n, "%02X ", frame[i]);
+                }
+                id(lv_last_frame).publish_state(std::string(hexbuf, n));
+
+          // -----------------------
+          // Decode A5 02 status frames
+          // -----------------------
+          if (frame.size() >= 23 && frame[1] == 0x02) {
+            auto get = [&](int idx) -> uint8_t {
+              if (idx < 0 || (size_t) idx >= frame.size()) return 0;
+              return frame[idx];
+            };
+
+            uint8_t tank      = get(14);
+            uint8_t water     = get(15);
+            uint8_t display   = get(16);
+            uint8_t target    = get(18);
+            uint8_t current   = get(19);
+            uint8_t mode_code = get(21);
+            uint8_t cool_raw  = get(22);
+            uint8_t warm      = get(23);  // 0–3 from status frame
+
+            // Tank & water
+            id(lv_tank_present).publish_state(tank == 0x00);
+            id(lv_water_out).publish_state(water == 0x01);
+
+            // Display (brightness > 0 = ON)
+            bool display_on = (display != 0x00);
+            id(lv_display_on).publish_state(display_on);
+            // Keep the HA display switch in sync with the device
+            id(lv_display_switch).publish_state(display_on);
+
+            // Humidity
+            id(lv_target_humidity).publish_state((float) target);
+            id(lv_current_humidity).publish_state((float) current);
+            id(lv_target_humidity_number).publish_state((float) target);
+
+            // Mode (manual / sleep / humidity)
+            std::string mode = "unknown";
+            if (mode_code == 0x01) {
+              mode = "manual";
+              id(lv_manual_mode).publish_state(true);
+              id(lv_sleep_mode).publish_state(false);
+            } else if (mode_code == 0x02) {
+              mode = "sleep";
+              id(lv_manual_mode).publish_state(false);
+              id(lv_sleep_mode).publish_state(true);
+            } else if (mode_code == 0x03) {
+              mode = "humidity";
+              id(lv_manual_mode).publish_state(false);
+              id(lv_sleep_mode).publish_state(false);
+            }
+            id(lv_mode_text).publish_state(mode);
+
+            // Save "real" humidity target ONLY when in humidity/auto mode (0x03)
+            // In manual, the device reports 100%, which we don't want to save.
+            if (mode_code == 0x03) {
+              id(lv_saved_target_humidity) = (int) target;
+            }
+
+            // Cool level: direct value 0–9 from status byte 22
+            int cool_level = (int) cool_raw;
+            id(lv_cool_level_sensor).publish_state((float) cool_level);
+            id(lv_cool_level_number).publish_state((float) cool_level);
+
+            // Save cool level whenever we're NOT in sleep mode.
+            // Sleep forces the fan to 9, and we don't want that to overwrite the user's level.
+            if (mode_code != 0x02) {
+              id(lv_saved_cool_level) = cool_level;
+            }
+
+            // Keep the simple "Sleep Mode" UI switch in sync:
+            if (mode_code == 0x02) {
+              id(lv_sleep_switch).publish_state(true);   // sleep
+            } else if (mode_code == 0x03) {
+              id(lv_sleep_switch).publish_state(false);  // humidity/auto
+            }
+
+            // Warm level 0–3 (we still only have a placeholder)
+            id(lv_warm_level_sensor).publish_state((float) warm);
+            id(lv_warm_level_number).publish_state((float) warm);
+          }
+
+
+
+                pos = end;
+                found = true;
+                break;
+              }
+            }
+
+            if (!found) {
+              // No full frame yet; wait for more data
+              break;
+            }
+          }
+
+          // Drop processed bytes from buffer
+          if (pos > 0 && pos <= buffer.size()) {
+            buffer.erase(buffer.begin(), buffer.begin() + pos);
+          }
+          // Avoid buffer growing forever
+          if (buffer.size() > 200) {
+            buffer.erase(buffer.begin(), buffer.end() - 200);
+          }
+
+
+# -------------------------------------------------------------------
+# TEXT SENSORS: raw frames & interpreted mode
+# -------------------------------------------------------------------
+text_sensor:
+  - platform: template
+    id: lv_last_frame
+    name: "Last Raw Frame"
+    icon: "mdi:hexagon-multiple"
+    update_interval: never
+
+  - platform: template
+    id: lv_mode_text
+    name: "Mode"
+    icon: "mdi:alpha-m-circle"
+    update_interval: never
+
+# -------------------------------------------------------------------
+# BINARY SENSORS: tank, water-out, display state
+# -------------------------------------------------------------------
+binary_sensor:
+  - platform: template
+    id: lv_tank_present
+    name: "Tank"
+    # no device_class -> shows as On / Off
+   # restore_mode: ALWAYS_OFF
+
+  - platform: template
+    id: lv_water_out
+    name: "Out of Water"
+    device_class: problem
+   # restore_mode: ALWAYS_OFF
+
+  - platform: template
+    id: lv_display_on
+    name: "Display Status"
+    icon: "mdi:monitor"
+  #  restore_mode: ALWAYS_OFF
+
+# -------------------------------------------------------------------
+# SENSORS: humidity, target, cool/warm level
+# -------------------------------------------------------------------
+sensor:
+  - platform: template
+    id: lv_current_humidity
+    name: "Current Humidity"
+    unit_of_measurement: "%"
+    icon: "mdi:water-percent"
+    accuracy_decimals: 0
+
+  - platform: template
+    id: lv_target_humidity
+    name: "Target Humidity"
+    unit_of_measurement: "%"
+    icon: "mdi:water-percent"
+    accuracy_decimals: 0
+
+  - platform: template
+    id: lv_cool_level_sensor
+    name: "Cool Level"
+    icon: "mdi:weather-windy"
+    accuracy_decimals: 0
+
+  - platform: template
+    id: lv_warm_level_sensor
+    name: "Warm Level"
+    icon: "mdi:radiator"
+    accuracy_decimals: 0
+
+# -------------------------------------------------------------------
+# SWITCHES: power, display
+# -------------------------------------------------------------------
+switch:
+  - platform: template
+    id: lv_sleep_switch
+    name: "Sleep Mode"
+    icon: "mdi:power-sleep"
+    optimistic: true
+
+  # --- Sleep Mode ---
+  - platform: template
+    id: lv_sleep_mode
+    name: "Sleep Mode Toggle"
+    icon: "mdi:power-sleep"
+    optimistic: true
+
+    turn_on_action:
+      - lambda: |-
+          // Remember cool level before entering sleep
+          id(lv_saved_cool_level) = (int) id(lv_cool_level_sensor).state;
+          // Enter SLEEP mode
+          // Use current target humidity from status (40–80)
+          int target = (int) id(lv_target_humidity).state;
+          if (target < 40) target = 40;
+          if (target > 80) target = 80;
+
+          // Frame from your capture:
+          // A5 22 <id> 0A 00 <CHK> 01 82 40 00 <TARGET> 00 00 00 00 00
+          uint8_t cmd_id = (uint8_t) id(lv_cmd_seq);
+          id(lv_cmd_seq) = (id(lv_cmd_seq) + 1) & 0xFF;
+
+          std::vector<uint8_t> frame = {
+            0xA5, 0x22, cmd_id, 0x0A,
+            0x00, 0x00,
+            0x01, 0x82, 0x40, 0x00,
+            (uint8_t) target,
+            0x00, 0x00, 0x00, 0x00, 0x00
+          };
+
+          uint32_t s = 0;
+          for (size_t i = 0; i < frame.size(); i++) {
+            if (i != 5) s += frame[i];
+          }
+          frame[5] = (0xFF - (s & 0xFF)) & 0xFF;
+
+          id(lv_uart).write_array(frame.data(), frame.size());
+
+    turn_off_action:
+      - lambda: |-
+          // Leave SLEEP -> back to HUMIDITY/AUTO
+          // From your traces, this is same pattern as "manual -> auto":
+          //   1) A5 22 .. 0A 00 ?? 01 29 A1 00 01 00 00 00 00 00
+          //   2) A5 22 .. 08 00 ?? 01 14 41 00 <TARGET> 00 00 00
+
+          // 1) Generic "mode = humidity" frame on 0x29A1
+          uint8_t cmd_id1 = (uint8_t) id(lv_cmd_seq);
+          id(lv_cmd_seq) = (id(lv_cmd_seq) + 1) & 0xFF;
+
+          std::vector<uint8_t> frame1 = {
+            0xA5, 0x22, cmd_id1, 0x0A,
+            0x00, 0x00,
+            0x01, 0x29, 0xA1, 0x00,
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00
+          };
+
+          uint32_t s1 = 0;
+          for (size_t i = 0; i < frame1.size(); i++) {
+            if (i != 5) s1 += frame1[i];
+          }
+          frame1[5] = (0xFF - (s1 & 0xFF)) & 0xFF;
+          id(lv_uart).write_array(frame1.data(), frame1.size());
+
+          // 2) Re-send target humidity (same shape as your app does)
+          int target = (int) id(lv_target_humidity).state;
+          if (target < 40) target = 40;
+          if (target > 80) target = 80;
+
+          uint8_t cmd_id2 = (uint8_t) id(lv_cmd_seq);
+          id(lv_cmd_seq) = (id(lv_cmd_seq) + 1) & 0xFF;
+
+          std::vector<uint8_t> frame2 = {
+            0xA5, 0x22, cmd_id2, 0x08,
+            0x00, 0x00,
+            0x01, 0x14, 0x41, 0x00,
+            (uint8_t) target,
+            0x00, 0x00, 0x00
+          };
+
+          uint32_t s2 = 0;
+          for (size_t i = 0; i < frame2.size(); i++) {
+            if (i != 5) s2 += frame2[i];
+          }
+          frame2[5] = (0xFF - (s2 & 0xFF)) & 0xFF;
+          id(lv_uart).write_array(frame2.data(), frame2.size());
+                    // 3) Restore cool level back to what it was before sleep
+          int level = id(lv_saved_cool_level);
+          if (level < 1) level = 1;
+          if (level > 9) level = 9;
+
+          uint8_t cmd_id3 = (uint8_t) id(lv_cmd_seq);
+          id(lv_cmd_seq) = (id(lv_cmd_seq) + 1) & 0xFF;
+
+          std::vector<uint8_t> frame3 = {
+            0xA5, 0x22, cmd_id3, 0x08,
+            0x00, 0x00,
+            0x01, 0x13, 0x41, 0x00,
+            (uint8_t) level,
+            0x00, 0x00, 0x00
+          };
+
+          uint32_t s3 = 0;
+          for (size_t i = 0; i < frame3.size(); i++) {
+            if (i != 5) s3 += frame3[i];
+          }
+          frame3[5] = (0xFF - (s3 & 0xFF)) & 0xFF;
+          id(lv_uart).write_array(frame3.data(), frame3.size());
+      # --- Manual Mode ---
+  - platform: template
+    id: lv_manual_mode
+    name: "Manual Mode Toggle"
+    icon: "mdi:hand-back-right"
+    optimistic: true
+
+    turn_on_action:
+      - lambda: |-
+          // Remember the target humidity we had in humidity mode
+          id(lv_saved_target_humidity) = (int) id(lv_target_humidity).state;
+          // HUMIDITY/AUTO -> MANUAL
+          // 1) 0x29A1 frame (mode/mode-group)
+          uint8_t cmd_id1 = (uint8_t) id(lv_cmd_seq);
+          id(lv_cmd_seq) = (id(lv_cmd_seq) + 1) & 0xFF;
+
+          std::vector<uint8_t> frame1 = {
+            0xA5, 0x22, cmd_id1, 0x0A,
+            0x00, 0x00,
+            0x01, 0x29, 0xA1, 0x00,
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00
+          };
+
+          uint32_t s1 = 0;
+          for (size_t i = 0; i < frame1.size(); i++) {
+            if (i != 5) s1 += frame1[i];
+          }
+          frame1[5] = (0xFF - (s1 & 0xFF)) & 0xFF;
+          id(lv_uart).write_array(frame1.data(), frame1.size());
+
+          // 2) 0x60A2 frame (mode-details), from your capture
+          uint8_t cmd_id2 = (uint8_t) id(lv_cmd_seq);
+          id(lv_cmd_seq) = (id(lv_cmd_seq) + 1) & 0xFF;
+
+          std::vector<uint8_t> frame2 = {
+            0xA5, 0x22, cmd_id2, 0x07,
+            0x00, 0x00,
+            0x01, 0x60, 0xA2, 0x00,
+            0x00, 0x01, 0x01
+          };
+
+          uint32_t s2 = 0;
+          for (size_t i = 0; i < frame2.size(); i++) {
+            if (i != 5) s2 += frame2[i];
+          }
+          frame2[5] = (0xFF - (s2 & 0xFF)) & 0xFF;
+          id(lv_uart).write_array(frame2.data(), frame2.size());
+
+    turn_off_action:
+      - lambda: |-
+          // MANUAL -> HUMIDITY/AUTO
+          // 1) 0x29A1 frame (same as above, different seq/checksum)
+          uint8_t cmd_id1 = (uint8_t) id(lv_cmd_seq);
+          id(lv_cmd_seq) = (id(lv_cmd_seq) + 1) & 0xFF;
+
+          std::vector<uint8_t> frame1 = {
+            0xA5, 0x22, cmd_id1, 0x0A,
+            0x00, 0x00,
+            0x01, 0x29, 0xA1, 0x00,
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00
+          };
+
+          uint32_t s1 = 0;
+          for (size_t i = 0; i < frame1.size(); i++) {
+            if (i != 5) s1 += frame1[i];
+          }
+          frame1[5] = (0xFF - (s1 & 0xFF)) & 0xFF;
+          id(lv_uart).write_array(frame1.data(), frame1.size());
+
+          // 2) 0x14 0x41 frame: restore the target we had BEFORE manual
+          int target = id(lv_saved_target_humidity);
+          if (target < 40) target = 40;
+          if (target > 80) target = 80;
+
+          uint8_t cmd_id2 = (uint8_t) id(lv_cmd_seq);
+          id(lv_cmd_seq) = (id(lv_cmd_seq) + 1) & 0xFF;
+
+          std::vector<uint8_t> frame2 = {
+            0xA5, 0x22, cmd_id2, 0x08,
+            0x00, 0x00,
+            0x01, 0x14, 0x41, 0x00,
+            (uint8_t) target,
+            0x00, 0x00, 0x00
+          };
+
+          uint32_t s2 = 0;
+          for (size_t i = 0; i < frame2.size(); i++) {
+            if (i != 5) s2 += frame2[i];
+          }
+          frame2[5] = (0xFF - (s2 & 0xFF)) & 0xFF;
+          id(lv_uart).write_array(frame2.data(), frame2.size());
+
+
+
+  - platform: template
+    id: lv_power
+    name: "Power"
+    icon: "mdi:power"
+    optimistic: true
+    turn_on_action:
+      - lambda: |-
+          // Power ON: A5 22 <id> 05 00 ?? 01 00 A0 00 01  (byte[5] = checksum-like)
+          uint8_t cmd_id = (uint8_t) id(lv_cmd_seq);
+          id(lv_cmd_seq) = (id(lv_cmd_seq) + 1) & 0xFF;
+          std::vector<uint8_t> frame = {
+            0xA5, 0x22, cmd_id, 0x05,
+            0x00, 0x00, 0x01, 0x00, 0xA0, 0x00,
+            0x01  // state = ON
+          };
+          uint32_t s = 0;
+          for (size_t i = 0; i < frame.size(); i++) if (i != 5) s += frame[i];
+          frame[5] = (0xFF - (s & 0xFF)) & 0xFF;
+          id(lv_uart).write_array(frame.data(), frame.size());
+
+    turn_off_action:
+      - lambda: |-
+          // Power OFF: A5 22 <id> 05 00 ?? 01 00 A0 00 00
+          uint8_t cmd_id = (uint8_t) id(lv_cmd_seq);
+          id(lv_cmd_seq) = (id(lv_cmd_seq) + 1) & 0xFF;
+          std::vector<uint8_t> frame = {
+            0xA5, 0x22, cmd_id, 0x05,
+            0x00, 0x00, 0x01, 0x00, 0xA0, 0x00,
+            0x00  // state = OFF
+          };
+          uint32_t s = 0;
+          for (size_t i = 0; i < frame.size(); i++) if (i != 5) s += frame[i];
+          frame[5] = (0xFF - (s & 0xFF)) & 0xFF;
+          id(lv_uart).write_array(frame.data(), frame.size());
+
+  - platform: template
+    id: lv_display_switch
+    name: "Display"
+    icon: "mdi:monitor"
+    optimistic: true
+    turn_on_action:
+      - lambda: |-
+          // Display ON: A5 22 <id> 05 00 ?? 01 05 A1 00 64
+          uint8_t cmd_id = (uint8_t) id(lv_cmd_seq);
+          id(lv_cmd_seq) = (id(lv_cmd_seq) + 1) & 0xFF;
+          std::vector<uint8_t> frame = {
+            0xA5, 0x22, cmd_id, 0x05,
+            0x00, 0x00, 0x01, 0x05, 0xA1, 0x00,
+            0x64  // brightness 100
+          };
+          uint32_t s = 0;
+          for (size_t i = 0; i < frame.size(); i++) if (i != 5) s += frame[i];
+          frame[5] = (0xFF - (s & 0xFF)) & 0xFF;
+          id(lv_uart).write_array(frame.data(), frame.size());
+
+    turn_off_action:
+      - lambda: |-
+          // Display OFF: A5 22 <id> 05 00 ?? 01 05 A1 00 00
+          uint8_t cmd_id = (uint8_t) id(lv_cmd_seq);
+          id(lv_cmd_seq) = (id(lv_cmd_seq) + 1) & 0xFF;
+          std::vector<uint8_t> frame = {
+            0xA5, 0x22, cmd_id, 0x05,
+            0x00, 0x00, 0x01, 0x05, 0xA1, 0x00,
+            0x00  // brightness 0
+          };
+          uint32_t s = 0;
+          for (size_t i = 0; i < frame.size(); i++) if (i != 5) s += frame[i];
+          frame[5] = (0xFF - (s & 0xFF)) & 0xFF;
+          id(lv_uart).write_array(frame.data(), frame.size());
+
+# -------------------------------------------------------------------
+# NUMBER: Timer (minutes) – sets/cancels timer
+# -------------------------------------------------------------------
+number:
+  - platform: template
+    id: lv_target_humidity_number
+    name: "Target Humidity (40–80)"
+    unit_of_measurement: "%"
+    icon: "mdi:water-percent"
+    min_value: 40
+    max_value: 80
+    step: 1
+    optimistic: true
+    set_action:
+      - lambda: |-
+          int target = (int) x;
+          if (target < 40) target = 40;
+          if (target > 80) target = 80;
+
+          // Build A5 22 target-humidity command:
+          // A5 22 <id> 08 00 <CHK> 01 14 41 00 <TARGET> 00 00 00
+          uint8_t cmd_id = (uint8_t) id(lv_cmd_seq);
+          id(lv_cmd_seq) = (id(lv_cmd_seq) + 1) & 0xFF;
+
+          std::vector<uint8_t> frame = {
+            0xA5, 0x22, cmd_id, 0x08,
+            0x00, 0x00, 0x01, 0x14, 0x41, 0x00,
+            (uint8_t) target, 0x00, 0x00, 0x00
+          };
+
+          // Compute checksum at index 5 so sum(frame) & 0xFF == 0xFF
+          uint32_t s = 0;
+          for (size_t i = 0; i < frame.size(); i++) {
+            if (i != 5) s += frame[i];
+          }
+          frame[5] = (0xFF - (s & 0xFF)) & 0xFF;
+
+          id(lv_uart).write_array(frame.data(), frame.size());
+ 
+  - platform: template
+    id: lv_cool_level_number
+    name: "Cool Level (0-9)"
+    icon: "mdi:fan"
+    min_value: 1
+    max_value: 9
+    step: 1
+    optimistic: true
+    set_action:
+      - lambda: |-
+          int level = (int) x;
+          if (level < 1) level = 1;
+          if (level > 9) level = 9;
+
+          // Build A5 22 command:
+          // A5 22 <id> 08 00 <chk> 01 13 41 00 <LEVEL> 00 00 00
+          uint8_t cmd_id = (uint8_t) id(lv_cmd_seq);
+          id(lv_cmd_seq) = (id(lv_cmd_seq) + 1) & 0xFF;
+
+          std::vector<uint8_t> frame = {
+            0xA5, 0x22, cmd_id, 0x08,
+            0x00, 0x00, 0x01, 0x13, 0x41, 0x00,
+            (uint8_t) level, 0x00, 0x00, 0x00
+          };
+
+          // Recompute checksum at index 5 so sum(frame) & 0xFF == 0xFF
+          uint32_t s = 0;
+          for (size_t i = 0; i < frame.size(); i++) {
+            if (i != 5) s += frame[i];
+          }
+          frame[5] = (0xFF - (s & 0xFF)) & 0xFF;
+
+          id(lv_uart).write_array(frame.data(), frame.size());
+
+  - platform: template
+    id: lv_warm_level_number
+    name: "Warm Level (0-3)"
+    icon: "mdi:radiator"
+    min_value: 0
+    max_value: 3
+    step: 1
+    optimistic: true
+    set_action:
+      - lambda: |-
+          int level = (int) x;
+          if (level < 0) level = 0;
+          if (level > 3) level = 3;
+
+          // Build A5 22 warm-level command:
+          // A5 22 <id> 09 00 <CHK> 01 12 41 00 <LEVEL> 00 00 00 00 00
+          uint8_t cmd_id = (uint8_t) id(lv_cmd_seq);
+          id(lv_cmd_seq) = (id(lv_cmd_seq) + 1) & 0xFF;
+
+          std::vector<uint8_t> frame = {
+            0xA5, 0x22, cmd_id, 0x09,
+            0x00, 0x00, 0x01, 0x12, 0x41, 0x00,
+            (uint8_t) level, 0x00, 0x00, 0x00, 0x00, 0x00
+          };
+
+          // Recompute checksum at index 5 so sum(frame) & 0xFF == 0xFF
+          uint32_t s = 0;
+          for (size_t i = 0; i < frame.size(); i++) {
+            if (i != 5) s += frame[i];
+          }
+          frame[5] = (0xFF - (s & 0xFF)) & 0xFF;
+
+          id(lv_uart).write_array(frame.data(), frame.size());
+
+  
+  
+  - platform: template
+    id: lv_timer_minutes
+    name: "Timer (minutes)"
+    icon: "mdi:timer"
+    unit_of_measurement: "min"
+    min_value: 0
+    max_value: 720     # up to 12 hours
+    step: 30
+    optimistic: true
+    set_action:
+      - lambda: |-
+          // Build "set/cancel timer" command
+          // Payload: 4-byte little-endian seconds at indices 10..13
+          int minutes = (int) x;
+          uint32_t secs = (uint32_t) (minutes * 60);
+          uint8_t cmd_id = (uint8_t) id(lv_cmd_seq);
+          id(lv_cmd_seq) = (id(lv_cmd_seq) + 1) & 0xFF;
+
+          std::vector<uint8_t> frame = {
+            0xA5, 0x22, cmd_id, 0x08,
+            0x00, 0x00, 0x01, 0x64, 0xA2, 0x00,
+            0x00, 0x00, 0x00, 0x00  // secs LE placeholder
+          };
+          frame[10] = (uint8_t) (secs & 0xFF);
+          frame[11] = (uint8_t) ((secs >> 8) & 0xFF);
+          frame[12] = (uint8_t) ((secs >> 16) & 0xFF);
+          frame[13] = (uint8_t) ((secs >> 24) & 0xFF);
+
+          uint32_t s = 0;
+          for (size_t i = 0; i < frame.size(); i++) if (i != 5) s += frame[i];
+          frame[5] = (0xFF - (s & 0xFF)) & 0xFF;
+          id(lv_uart).write_array(frame.data(), frame.size());
+
