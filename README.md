@@ -190,15 +190,7 @@ On exiting Sleep → previous cool level restored
 
 All incoming changes (panel buttons or cloud/app) sync back to HA immediately
 
-📁 File Structure Suggestion
-/
-├── esphome/
-│   ├── lv600s.yaml           # Main firmware
-│   └── secrets.yaml
-├── docs/
-│   ├── protocol.md           # Detailed protocol reference
-│   └── wiring.png            # Wiring diagram
-└── README.md
+
 
 🙌 Credits
 
