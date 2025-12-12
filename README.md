@@ -3,6 +3,8 @@ ESPHOME Yaml for Levoit Humidifiers
 
 Flashing instrusctions and wiring diagrams coming soon
 
+Support for the 600s and the 450s models via differnt yaml (they were similar but the 450s series has a differnt set of frames for control)
+
 📘 Levoit LV600S Local UART Control (ESPHome Bridge)
 
 Local, cloud-free control of the Levoit LV600S humidifier using an ESP32 over UART.
