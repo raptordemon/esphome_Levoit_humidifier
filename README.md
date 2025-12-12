@@ -13,6 +13,19 @@ it is possible to just add this on top and use it with the VeSync app at the sam
 
 Support for the 600s and the 450s models via differnt yaml (they were similar but the 450s series has a differnt set of frames for control) pls use the correct YAML for your device.
 
+IMPORTANT, if you decide to flash the internal chip on your device, make a backup first and make sure that the board is setup like this:
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_FREERTOS_UNICORE: y
+
+
+The build in ESP32 seems to be the solo single core version.
+it can be flashed using ESPTOOL but i am not familiar enough with ESPTOOL to give directions here.
+
 📘 Levoit LV600S Local UART Control (ESPHome Bridge)
 
 Local, cloud-free control of the Levoit LV600S humidifier using an ESP32 over UART.
