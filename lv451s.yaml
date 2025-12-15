@@ -87,9 +87,9 @@ uart:
               if ((s & 0xFF) == 0xFF) {
                 vector<uint8_t> frame(buffer.begin() + pos, buffer.begin() + end);
 
-                // Publish raw frame as hex
+                // Publish raw frame as hex original 256
                 {
-                  char hexbuf[256];
+                  char hexbuf[512];
                   size_t n = 0;
                   for (size_t i = 0; i < frame.size(); i++) {
                     if (n + 3 >= sizeof(hexbuf)) break;
@@ -523,53 +523,69 @@ number:
           if (target < 40) target = 40;
           if (target > 80) target = 80;
 
-          // ---------- Phase 1: E8 A2 "set target" ----------
-          // From sniffer:
-          // A5 22 <ID> 06 00 <YY> 01 E8 A2 00 00 <TT>
-          // with (sum(all bytes) & 0xFF) == 0xFF
+          // ----- Phase 0: PREP / ARM (29 A1) -----
+          {
+            uint8_t cmd_id = (uint8_t) id(lv_cmd_seq);
+            id(lv_cmd_seq) = (id(lv_cmd_seq) + 1) & 0xFF;
 
+            std::vector<uint8_t> frame = {
+              0xA5, 0x22, cmd_id, 0x0A,
+              0x00, 0x00,
+              0x01, 0x29, 0xA1, 0x00,
+              0x01, 0x00, 0x00, 0x00, 0x00, 0x00
+            };
+
+            uint32_t s = 0;
+            for (size_t i = 0; i < frame.size(); i++) if (i != 5) s += frame[i];
+            frame[5] = (0xFF - (s & 0xFF)) & 0xFF;
+
+            id(lv_uart).write_array(frame.data(), frame.size());
+          }
+      - delay: 80ms
+
+      - lambda: |-
+          int target = (int) id(lv_target_humidity_number).state;
+          if (target < 40) target = 40;
+          if (target > 80) target = 80;
+
+          // ----- Phase 1: SET TARGET (E8 A2) -----
           {
             uint8_t cmd_id = (uint8_t) id(lv_cmd_seq);
             id(lv_cmd_seq) = (id(lv_cmd_seq) + 1) & 0xFF;
 
             std::vector<uint8_t> frame = {
               0xA5, 0x22, cmd_id, 0x06,
-              0x00, 0x00, 0x01, 0xE8, 0xA2, 0x00, 0x00,
-              (uint8_t) target   // TT
+              0x00, 0x00,
+              0x01, 0xE8, 0xA2, 0x00, 0x00,
+              (uint8_t) target
             };
 
             uint32_t s = 0;
-            for (size_t i = 0; i < frame.size(); i++) {
-              if (i != 5) s += frame[i];
-            }
+            for (size_t i = 0; i < frame.size(); i++) if (i != 5) s += frame[i];
             frame[5] = (0xFF - (s & 0xFF)) & 0xFF;
 
             id(lv_uart).write_array(frame.data(), frame.size());
           }
+      - delay: 80ms
 
-          // ---------- Phase 2: 10 41 "apply" ----------
-          // From sniffer:
-          // A5 22 <ID> 04 00 <YY> 01 10 41 00
-          // same checksum rule on index-5
-
+      - lambda: |-
+          // ----- Phase 2: APPLY (10 41) -----
           {
             uint8_t cmd_id = (uint8_t) id(lv_cmd_seq);
             id(lv_cmd_seq) = (id(lv_cmd_seq) + 1) & 0xFF;
 
             std::vector<uint8_t> frame = {
               0xA5, 0x22, cmd_id, 0x04,
-              0x00, 0x00, 0x01, 0x10, 0x41, 0x00
+              0x00, 0x00,
+              0x01, 0x10, 0x41
             };
 
             uint32_t s = 0;
-            for (size_t i = 0; i < frame.size(); i++) {
-              if (i != 5) s += frame[i];
-            }
+            for (size_t i = 0; i < frame.size(); i++) if (i != 5) s += frame[i];
             frame[5] = (0xFF - (s & 0xFF)) & 0xFF;
 
             id(lv_uart).write_array(frame.data(), frame.size());
           }
-
   # -----------------------------------------------------------------
   # Cool mist level – 13 41, 1–9 (works now)
   # -----------------------------------------------------------------
@@ -654,3 +670,4 @@ number:
           if (seq >= 0x40) {
             seq = 0x0F;  // wrap back into a similar range as the app
           }
+
